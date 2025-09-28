@@ -2,7 +2,7 @@ import os, math, tempfile, subprocess, uuid
 from flask import Flask, request, send_file, abort, render_template_string, after_this_request
 
 app = Flask(__name__)
-MAX_MB = 4096  # basic guard
+MAX_MB = 4096
 
 HTML = """
 <!doctype html>
@@ -12,34 +12,50 @@ HTML = """
   body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px}
   .box{border:2px dashed #bbb;border-radius:16px;padding:28px;text-align:center}
   .box.drag{border-color:#000}
-  .row{margin-top:16px;display:flex;gap:12px;align-items:center;justify-content:center}
+  .row{margin-top:16px;display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap}
   input[type=number]{width:120px;padding:8px}
   button{padding:10px 16px;border:0;border-radius:10px;background:#111;color:#fff;cursor:pointer}
+  #choose{background:#eee;color:#111}
   small{color:#666}
 </style>
 <div class="box" id="drop">
   <h2>drag & drop a video here</h2>
-  <div>or <label style="text-decoration:underline;cursor:pointer"><input id="file" type="file" name="file" accept="video/*" hidden>click to choose</label></div>
   <div class="row">
+    <input id="file" type="file" name="file" accept="video/*" hidden>
+    <button id="choose" type="button">choose a file</button>
     <label>target size (mb): <input id="mb" type="number" min="1" max="4096" value="25"></label>
-    <button id="go">compress</button>
+    <button id="go" type="button">compress</button>
   </div>
   <div class="row"><small id="status"></small></div>
 </div>
 <script>
 const drop = document.getElementById('drop');
 const fileInput = document.getElementById('file');
+const choose = document.getElementById('choose');
 const go = document.getElementById('go');
 const mb = document.getElementById('mb');
 const statusEl = document.getElementById('status');
-let file=null;
+let file=null, picking=false;
 
 function setStatus(t){ statusEl.textContent=t; }
+
 ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('drag');}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('drag');}));
 drop.addEventListener('drop', ev=>{ file = ev.dataTransfer.files[0]; setStatus(file?`selected: ${file.name}`:''); });
-drop.addEventListener('click', ()=>fileInput.click());
-fileInput.addEventListener('change', ()=>{ file = fileInput.files[0]; setStatus(file?`selected: ${file.name}`:''); });
+
+choose.addEventListener('click', (e)=>{
+  e.stopPropagation();
+  if(picking) return;
+  picking = true;
+  fileInput.value = '';
+  fileInput.click();
+});
+
+fileInput.addEventListener('change', ()=>{
+  picking = false;
+  file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+  setStatus(file?`selected: ${file.name}`:'');
+});
 
 go.addEventListener('click', async ()=>{
   if(!file){ setStatus('pick a file'); return; }
@@ -58,8 +74,8 @@ go.addEventListener('click', async ()=>{
     }
     const blob = await res.blob();
     const dispo = res.headers.get('Content-Disposition') || '';
-    const m = dispo.match(/filename="(.+?)"/);
-    const name = m? m[1] : 'compressed.mp4';
+    const m2 = dispo.match(/filename="(.+?)"/);
+    const name = m2? m2[1] : 'compressed.mp4';
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = name; document.body.appendChild(a); a.click();
@@ -75,10 +91,10 @@ def _have(cmd):
 
 def _ffprobe_duration(path):
     try:
-        out = subprocess.check_output([
-            'ffprobe','-v','error','-show_entries','format=duration',
-            '-of','default=noprint_wrappers=1:nokey=1', path
-        ], stderr=subprocess.DEVNULL).decode().strip()
+        out = subprocess.check_output(
+            ['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1', path],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
         return float(out)
     except Exception:
         return 0.0
@@ -98,20 +114,17 @@ def compress():
     target_mb = int(t)
     if target_mb<=0 or target_mb>MAX_MB:
         return abort(400, "invalid target_mb")
-    # save upload
     tmpdir = tempfile.mkdtemp(prefix="vc_")
-    inpath = os.path.join(tmpdir, f"{uuid.uuid4()}.{(f.filename or 'in').split('.')[-1]}")
+    ext = (f.filename or 'in').rsplit('.',1)[-1]
+    inpath = os.path.join(tmpdir, f"{uuid.uuid4()}.{ext}")
     f.save(inpath)
     dur = _ffprobe_duration(inpath)
     if dur<=0:
         return abort(400, "unable to read duration")
-    # compute bitrate_k (no audio), minus 5% container overhead
     bytes_per_mb = 1048576
-    size_bits = target_mb * bytes_per_mb * 8
-    usable_bits = int(size_bits * 0.95)
-    bitrate_bps = max(1, usable_bits // int(math.ceil(dur)))
+    usable_bits = int(target_mb * bytes_per_mb * 8 * 0.95)
+    bitrate_bps = max(1, usable_bits // max(1, int(math.ceil(dur))))
     bitrate_k = max(1, bitrate_bps // 1024)
-    # output
     base = os.path.splitext(os.path.basename(f.filename or "video"))[0] or "video"
     outpath = os.path.join(tmpdir, f"{base}_compressed.mp4")
     cmd = ['ffmpeg','-y','-i', inpath, '-c:v','libx265','-b:v', f'{bitrate_k}k','-an', outpath]
@@ -124,7 +137,6 @@ def compress():
     def cleanup(resp):
         try:
             if os.path.exists(inpath): os.remove(inpath)
-            # keep outpath until send finishes; temp dir will be removed by system later
         except Exception:
             pass
         return resp
